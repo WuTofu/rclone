@@ -82,22 +82,21 @@ type Options struct {
 type TorboxFile struct {
 	ID       int    `json:"id"`
 	Name     string `json:"name"`
-	Hash     string `json:"hash"`
+	Md5      string `json:"md5"`
 	Size     int64  `json:"size"`
-	Zipped   bool   `json:"zipped"`
-	S3Path   string `json:"s3_path"`
-	Infected bool   `json:"infected"`
 	Mimetype string `json:"mimetype"`
 }
 
 // Define the torrent struct type at the package level
 type TorboxTorrent struct {
-	ID    int          `json:"id"`
-	Name  string       `json:"name"`
-	Hash  string       `json:"hash,omitempty"`
-	Size  int64        `json:"size"`
-	Type  string       `json:"type"`
-	Files []TorboxFile `json:"files"`
+	ID    int           `json:"id"`
+	Name  string       	`json:"name"`
+	Hash  string        `json:"hash,omitempty"`
+	Size  int64         `json:"size"`
+	Type  string        `json:"type"`
+	Files []TorboxFile  `json:"files"`
+	Finished bool       `json:"download_finished"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // Fs represents a remote cloud storage system
@@ -146,19 +145,12 @@ func (f *Fs) FindLeaf(ctx context.Context, dir string, leaf string) (pathID stri
 type Object struct {
 	fs          *Fs       // what this object is part of
 	remote      string    // The remote path
-	hasMetaData bool      // metadata is present and correct
 	size        int64     // size of the object
 	modTime     time.Time // modification time of the object
 	id          string    // ID of the object - need to confirm with Torbox API
 	parentID    string    // ID of parent directory - need to confirm with Torbox API
 	mimeType    string    // Mime type of object
 	url         string    // URL to download file
-	// Additional metadata from torrent files
-	fileID      int       // File ID within the torrent
-	hash        string    // Hash of the torrent this file belongs to
-	s3Path      string    // S3 path of the file
-	infected    bool      // Whether file is infected
-	zipped      bool      // Whether file is zipped
 }
 
 // ------------------------------------------------------------
@@ -237,7 +229,9 @@ func errorHandler(resp *http.Response) error {
 
 // Return a url.Values without the api key since it will be in header
 func (f *Fs) baseParams() url.Values {
-	return url.Values{} // No longer need to add API key here
+	params := url.Values{}
+	params.Set("token", f.opt.APIKey)
+	return params
 }
 
 // NewFs constructs an Fs from the path, container:path
@@ -296,6 +290,9 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	fileCount, dirCount := 0, 0
 	
 	for _, torrent := range f.cache.items {
+		if !torrent.Finished {
+			continue
+		}
 		torrentEntries, torrentFiles, torrentDirs := f.processTorrentForListing(&torrent, dir, seenDirs)
 		entries = append(entries, torrentEntries...)
 		fileCount += torrentFiles
@@ -392,15 +389,10 @@ func (f *Fs) createObject(torrent *TorboxTorrent, file *TorboxFile, dir, relativ
 	return &Object{
 		fs:          f,
 		remote:      remote,
-		id:          fmt.Sprintf("%s:%d", torrent.Hash, file.ID),
+		id:          fmt.Sprintf("%s:%d", torrent.ID, file.ID),
 		size:        file.Size,
 		mimeType:    file.Mimetype,
-		hasMetaData: true,
-		fileID:      file.ID,
-		hash:        torrent.Hash,
-		s3Path:      file.S3Path,
-		infected:    file.Infected,
-		zipped:      file.Zipped,
+		modTime:     torrent.UpdatedAt,
 	}
 }
 
@@ -423,9 +415,9 @@ func (f *Fs) refreshCache(ctx context.Context) error {
 	}
 
 	var torrentListResult struct {
-		Success bool           `json:"success"`
-		Error   string        `json:"error"`
-		Detail  string        `json:"detail"`
+		Success bool           	`json:"success"`
+		Error   string        	`json:"error"`
+		Detail  string        	`json:"detail"`
 		Data    []TorboxTorrent `json:"data"`
 	}
 
@@ -493,15 +485,10 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 				o := &Object{
 					fs:          f,
 					remote:      remote,
-					id:          fmt.Sprintf("%s:%d", torrent.Hash, file.ID), // Fixed: use torrent.Hash for consistency
+					id:          fmt.Sprintf("%s:%d", torrent.ID, file.ID), // Fixed: use torrent.Hash for consistency
 					size:        file.Size,
 					mimeType:    file.Mimetype,
-					hasMetaData: true,
-					fileID:      file.ID,
-					hash:        torrent.Hash, // Fixed: use torrent.Hash for consistency
-					s3Path:      file.S3Path,
-					infected:    file.Infected,
-					zipped:      file.Zipped,
+					modTime:     torrent.UpdatedAt,
 				}
 				return o, nil
 			}
@@ -630,7 +617,6 @@ func (f *Fs) DirCacheFlush() {
 
 // Hashes returns the supported hash sets.
 func (f *Fs) Hashes() hash.Set {
-	// Need to confirm supported hashes with Torbox API
 	return hash.Set(hash.None)
 }
 
@@ -692,10 +678,10 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	if len(parts) != 2 {
 		return nil, errors.New("invalid object ID format")
 	}
-	hash := parts[0]
+	torrentID := parts[0]
 	fileID := parts[1]
 	
-	fs.Debugf(o.fs, "torbox: Requesting download URL for hash %q, file ID %q", hash, fileID)
+	fs.Debugf(o.fs, "torbox: Requesting download URL for torrent ID %q, file ID %q", torrentID, fileID)
 
 	// Call /v1/api/torrents/requestdl to get the download URL
 	opts := rest.Opts{
@@ -703,7 +689,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		Path:       "/torrents/requestdl",
 		Parameters: o.fs.baseParams(),
 	}
-	opts.Parameters.Set("torrent_id", hash)
+	opts.Parameters.Set("torrent_id", torrentID)
 	opts.Parameters.Set("file_id", fileID)
 	opts.Parameters.Set("zip_link", "false")  // Default to false per API spec
 	opts.Parameters.Set("redirect", "false")  // We want the URL, not a redirect
@@ -761,115 +747,13 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 
 // Remove an object
 func (o *Object) Remove(ctx context.Context) error {
-	fs.Debugf(o.fs, "torbox: Removing object %q", o.remote)
-	
-	// Extract item ID and type from the object ID
-	parts := strings.SplitN(o.id, ":", 2)
-	if len(parts) != 2 {
-		return errors.New("invalid object ID format")
-	}
-	itemID := parts[0]
-	itemType := parts[1]
-	
-	fs.Debugf(o.fs, "torbox: Attempting to remove item ID %q of type %q", itemID, itemType)
-
-	var resp *http.Response
-	var result struct {
-		Success bool `json:"success"`
-		Error   string `json:"error"`
-		Detail  string `json:"detail"`
-	}
-
-	// Call the appropriate delete endpoint based on item type
-	switch itemType {
-	case "torrent":
-		fs.Debugf(o.fs, "torbox: Deleting torrent %q", itemID)
-		opts := rest.Opts{
-			Method: "POST",
-			Path:   "/torrents/controltorrent",
-			Parameters: o.fs.baseParams(),
-			Body: strings.NewReader(fmt.Sprintf(`{"operation": "delete", "torrent_id": %s}`, itemID)),
-			ContentType: "application/json",
-		}
-		var err error
-		err = o.fs.pacer.Call(func() (bool, error) {
-			resp, err = o.fs.srv.CallJSON(ctx, &opts, nil, &result)
-			return shouldRetry(ctx, resp, err)
-		})
-		if err != nil {
-			fs.Debugf(o.fs, "torbox: Failed to delete torrent %q: %v", itemID, err)
-			return fmt.Errorf("failed to delete torrent: %w", err)
-		}
-		if !result.Success {
-			fs.Debugf(o.fs, "torbox: API error deleting torrent %q: %s", itemID, result.Error+": "+result.Detail)
-			return errors.New(result.Error + ": " + result.Detail)
-		}
-
-	case "usenet":
-		fs.Debugf(o.fs, "torbox: Deleting usenet download %q", itemID)
-		opts := rest.Opts{
-			Method: "POST",
-			Path:   "/usenet/controlusenetdownload",
-			Parameters: o.fs.baseParams(),
-			Body: strings.NewReader(fmt.Sprintf(`{"operation": "delete", "usenet_id": %s}`, itemID)),
-			ContentType: "application/json",
-		}
-		var err error
-		err = o.fs.pacer.Call(func() (bool, error) {
-			resp, err = o.fs.srv.CallJSON(ctx, &opts, nil, &result)
-			return shouldRetry(ctx, resp, err)
-		})
-		if err != nil {
-			fs.Debugf(o.fs, "torbox: Failed to delete usenet download %q: %v", itemID, err)
-			return fmt.Errorf("failed to delete usenet download: %w", err)
-		}
-		if !result.Success {
-			fs.Debugf(o.fs, "torbox: API error deleting usenet download %q: %s", itemID, result.Error+": "+result.Detail)
-			return errors.New(result.Error + ": " + result.Detail)
-		}
-
-	case "webdl":
-		fs.Debugf(o.fs, "torbox: Deleting web download %q", itemID)
-		opts := rest.Opts{
-			Method: "POST",
-			Path:   "/webdl/controlwebdownload",
-			Parameters: o.fs.baseParams(),
-			Body: strings.NewReader(fmt.Sprintf(`{"operation": "delete", "webdl_id": %s}`, itemID)),
-			ContentType: "application/json",
-		}
-		var err error
-		err = o.fs.pacer.Call(func() (bool, error) {
-			resp, err = o.fs.srv.CallJSON(ctx, &opts, nil, &result)
-			return shouldRetry(ctx, resp, err)
-		})
-		if err != nil {
-			fs.Debugf(o.fs, "torbox: Failed to delete web download %q: %v", itemID, err)
-			return fmt.Errorf("failed to delete web download: %w", err)
-		}
-		if !result.Success {
-			fs.Debugf(o.fs, "torbox: API error deleting web download %q: %s", itemID, result.Error+": "+result.Detail)
-			return errors.New(result.Error + ": " + result.Detail)
-		}
-
-	default:
-		fs.Debugf(o.fs, "torbox: Unsupported item type for deletion: %q", itemType)
-		return errors.New("unsupported item type for deletion")
-	}
-
-	// Invalidate the cache after deletion
-	fs.Debugf(o.fs, "torbox: Invalidating cache after successful deletion of %q", o.remote)
-	o.fs.cache.mu.Lock()
-	o.fs.cache.lastUpdated = time.Time{} // Invalidate cache
-	o.fs.cache.mu.Unlock()
-
-	fs.Debugf(o.fs, "torbox: Successfully removed object %q", o.remote)
-	return nil
+	return errors.New("Remove not implemented yet")
 }
 
 // MimeType of an Object if known, "" otherwise
 func (o *Object) MimeType(ctx context.Context) string {
 	// Need to implement getting mime type - API doesn't seem to provide it directly in list
-	return ""
+	return o.mimeType
 }
 
 // ID returns the ID of the Object if known, or "" if not
